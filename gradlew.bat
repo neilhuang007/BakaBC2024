@@ -36,6 +36,11 @@ for %%i in ("%APP_HOME%") do set APP_HOME=%%~fi
 @rem Add default JVM options here. You can also use JAVA_OPTS and GRADLE_OPTS to pass JVM options to this script.
 set DEFAULT_JVM_OPTS="-Xmx64m" "-Xms64m"
 
+@rem Battlecode 2024 must run on Java 8. Allow a project-specific override and
+@rem prefer the standard Zulu 8 installation over a newer system JAVA_HOME.
+if defined BATTLECODE_JAVA_HOME set JAVA_HOME=%BATTLECODE_JAVA_HOME%
+if not defined BATTLECODE_JAVA_HOME if exist "C:\Program Files\Zulu\zulu-8\bin\java.exe" set JAVA_HOME=C:\Program Files\Zulu\zulu-8
+
 @rem Find java.exe
 if defined JAVA_HOME goto findJavaFromJavaHome
 
