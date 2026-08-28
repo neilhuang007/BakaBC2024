@@ -63,7 +63,7 @@ public final class OpeningLayoutPlanner {
         Corner primary = safestCorner(symmetry, null);
         Corner secondaryCorner = safestCorner(symmetry, primary);
         MapLocation[] primarySlots = targetsForCorner(primary);
-        MapLocation secondaryTarget = cornerPoint(secondaryCorner, 1, 1);
+        MapLocation secondaryTarget = cornerPoint(secondaryCorner, 1, 0);
 
         int bestSecondaryFlag = 0;
         int bestSwap = 0;
@@ -232,9 +232,9 @@ public final class OpeningLayoutPlanner {
 
     private MapLocation[] targetsForCorner(Corner corner) {
         return new MapLocation[]{
-                cornerPoint(corner, 1, 1),
-                cornerPoint(corner, 7, 1),
-                cornerPoint(corner, 1, 7)
+                cornerPoint(corner, 1, 0),
+                cornerPoint(corner, 13, 0),
+                cornerPoint(corner, 7, 0)
         };
     }
 

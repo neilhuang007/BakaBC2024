@@ -13,6 +13,11 @@ import dev.knowledge.TurnContext;
 /** Runtime coordinator for setup flag placement and layered fortification. */
 public final class OpeningManager {
     private static final int CORNER_ZONE_RADIUS_SQUARED = 225;
+    private static final int FLAG_RESERVATION_SEARCH_RADIUS = 5;
+    private static final int SURPLUS_CONSTRUCTION_CRUMBS = 5000;
+    private static final int ABUNDANT_CONSTRUCTION_CRUMBS = 15000;
+    private static final int OVERFLOW_CONSTRUCTION_CRUMBS = 25000;
+    private static final int CONSTRUCTION_STALL_ROUNDS = 40;
     public static final int FLAG_STATUS_UNKNOWN = 0;
     public static final int FLAG_STATUS_CARRIED = 1;
     public static final int FLAG_STATUS_RESERVED = 2;
@@ -31,14 +36,19 @@ public final class OpeningManager {
     private OpeningLayoutPlanner.Symmetry layoutSymmetry = OpeningLayoutPlanner.Symmetry.UNKNOWN;
     private OpeningLayoutPlanner.Layout layout;
     private int carrierSlot = -1;
-    private int carrierStunMask;
     private Boolean secondaryCommitted;
+    private boolean carrierFallback;
+    private MapLocation carrierProgressTarget;
+    private int carrierBestDistance = Integer.MAX_VALUE;
+    private int carrierLastProgressRound;
     private boolean coordinator;
 
     private FortificationPlanner.Site assignedSite;
     private int assignedGlobalStage = -1;
     private int assignedRound;
     private MapLocation constructionTarget;
+    private int observedFortificationWord = -1;
+    private int fortificationProgressRound;
 
     public OpeningManager(RobotController controller, int stableId) {
         this.controller = controller;
@@ -74,14 +84,18 @@ public final class OpeningManager {
         }
         if (coordinator) shared.writeLayoutZoneCount(forceSingle ? 1 : layout.zoneCount);
 
-        if (turn.hasFlag && carrierSlot < 0) {
-            carrierSlot = layoutPlanner.nearestSpawnCenter(turn.location);
+        if (isSetupFlagLifecycleRound(turn.round) && turn.hasFlag && carrierSlot < 0) {
+            carrierSlot = recoverableFlagSlot(turn.location);
+            if (carrierSlot < 0) carrierSlot = layoutPlanner.nearestSpawnCenter(turn.location);
             shared.writeFlagStatus(carrierSlot, FLAG_STATUS_CARRIED);
+            resetCarrierProgress(turn.round);
         }
+        if (isSetupFlagLifecycleRound(turn.round) && turn.hasFlag) updateCarrierProgress(turn);
         prepareConstruction(turn, forceSingle);
         if (turn.round == GameConstants.SETUP_ROUNDS && coordinator && shared.claimSummary()) {
             printSummary();
         }
+        if (turn.round == 2000 && coordinator) printDefenseSummary(turn);
     }
 
     public boolean tryFlagAction(TurnContext turn) throws GameActionException {
@@ -89,15 +103,22 @@ public final class OpeningManager {
         if (!turn.hasFlag) {
             if (turn.round >= 198) return false;
             FlagInfo best = null;
+            int bestSlot = -1;
             for (FlagInfo flag : turn.allyFlags) {
                 if (flag.isPickedUp() || !turn.location.equals(flag.getLocation())
                         || !controller.canPickupFlag(flag.getLocation())) continue;
-                if (best == null || flag.getID() < best.getID()) best = flag;
+                int slot = recoverableFlagSlot(flag.getLocation());
+                if (slot < 0) continue;
+                if (best == null || flag.getID() < best.getID()) {
+                    best = flag;
+                    bestSlot = slot;
+                }
             }
             if (best != null) {
-                carrierSlot = layoutPlanner.nearestSpawnCenter(best.getLocation());
+                carrierSlot = bestSlot;
                 controller.pickupFlag(best.getLocation());
                 shared.writeFlagStatus(carrierSlot, FLAG_STATUS_CARRIED);
+                resetCarrierProgress(turn.round);
                 System.out.println("OPENING_PICKUP|slot=" + carrierSlot + "|round=" + turn.round
                         + "|loc=" + turn.location.x + "," + turn.location.y);
                 return true;
@@ -109,21 +130,21 @@ public final class OpeningManager {
         MapLocation desired = carrierDestination(turn);
         MapLocation reserved = shared.readFlagLocation(carrierSlot);
         if (reserved == null) {
-            MapLocation searchCenter = turn.round >= 194
-                    && turn.location.distanceSquaredTo(desired) > GameConstants.VISION_RADIUS_SQUARED
-                    ? turn.location : desired;
-            reserved = findLegalReservation(searchCenter);
+            reserved = findLegalReservation(desired);
             if (reserved != null) {
                 shared.writeFlagLocation(carrierSlot, reserved);
                 shared.writeFlagStatus(carrierSlot, FLAG_STATUS_RESERVED);
             }
         }
 
-        if (turn.round >= 198 && reserved != null && controller.canDropFlag(reserved)) {
+        if (reserved != null && controller.canDropFlag(reserved)) {
             controller.dropFlag(reserved);
             shared.writeFlagLocation(carrierSlot, reserved);
             shared.writeFlagStatus(carrierSlot, FLAG_STATUS_PLACED);
+            System.out.println("OPENING_DROP|slot=" + carrierSlot + "|round=" + turn.round
+                    + "|loc=" + reserved.x + "," + reserved.y);
             carrierSlot = -1;
+            resetCarrierProgress(turn.round);
             return true;
         }
         return false;
@@ -143,14 +164,15 @@ public final class OpeningManager {
     }
 
     public boolean tryConstruct(TurnContext turn) throws GameActionException {
-        if (controller.hasFlag() && turn.round <= GameConstants.SETUP_ROUNDS) {
-            return tryCarrierInnerStun(turn);
-        }
         if (!isEligibleBuilder(turn) || turn.hasFlag || turn.enemies.length > 0 || turn.enemyFlags.length > 0
-                || !controller.isActionReady()) return false;
+                || !controller.isActionReady() || !allFlagsPlaced()) return false;
         int stage = shared.readFortificationStage();
         if (stage == 4) return tryBuildDamTrap(turn);
         if (assignedSite == null) return false;
+        if (!controller.onTheMap(assignedSite.location)) {
+            finishAssignedSite();
+            return false;
+        }
         if (!controller.canSenseLocation(assignedSite.location)
                 || turn.location.distanceSquaredTo(assignedSite.location) > GameConstants.INTERACT_RADIUS_SQUARED) {
             if (turn.round - assignedRound > 30) finishAssignedSite();
@@ -202,6 +224,7 @@ public final class OpeningManager {
 
     private MapLocation carrierDestination(TurnContext turn) throws GameActionException {
         if (carrierSlot < 0) return turn.location;
+        if (carrierFallback) return spawnCenters[carrierSlot];
         if (shared.isSingleZoneForced() || symmetry == OpeningLayoutPlanner.Symmetry.UNKNOWN) {
             return layout.conservativeTargets[carrierSlot];
         }
@@ -217,8 +240,50 @@ public final class OpeningManager {
         return layout.primaryTargets[carrierSlot];
     }
 
+    private void updateCarrierProgress(TurnContext turn) throws GameActionException {
+        if (carrierSlot < 0 || carrierFallback) return;
+        MapLocation destination = carrierDestination(turn);
+        if (!destination.equals(carrierProgressTarget)) {
+            carrierProgressTarget = destination;
+            carrierBestDistance = OpeningLayoutPlanner.chebyshev(turn.location, destination);
+            carrierLastProgressRound = turn.round;
+            return;
+        }
+        int distance = OpeningLayoutPlanner.chebyshev(turn.location, destination);
+        if (distance < carrierBestDistance) {
+            carrierBestDistance = distance;
+            carrierLastProgressRound = turn.round;
+        }
+        if (!transportFallbackRequired(turn.round, carrierLastProgressRound)) return;
+
+        carrierFallback = true;
+        shared.writeFlagLocation(carrierSlot, null);
+        shared.writeFlagStatus(carrierSlot, FLAG_STATUS_CARRIED);
+        System.out.println("OPENING_FALLBACK|slot=" + carrierSlot + "|round=" + turn.round
+                + "|from=" + turn.location.x + "," + turn.location.y
+                + "|spawn=" + spawnCenters[carrierSlot].x + "," + spawnCenters[carrierSlot].y);
+    }
+
+    private void resetCarrierProgress(int round) {
+        carrierFallback = false;
+        carrierProgressTarget = null;
+        carrierBestDistance = Integer.MAX_VALUE;
+        carrierLastProgressRound = round;
+    }
+
+    static boolean transportFallbackRequired(int round, int lastProgressRound) {
+        return round >= 150 || round - lastProgressRound >= 30;
+    }
+
+    static boolean isSetupFlagLifecycleRound(int round) {
+        return round <= GameConstants.SETUP_ROUNDS;
+    }
+
     private MapLocation findLegalReservation(MapLocation center) throws GameActionException {
-        for (int radius = 0; radius <= 5; radius++) {
+        MapLocation best = null;
+        int bestWallDistance = Integer.MAX_VALUE;
+        int bestRadius = Integer.MAX_VALUE;
+        for (int radius = 0; radius <= FLAG_RESERVATION_SEARCH_RADIUS; radius++) {
             for (int dx = -radius; dx <= radius; dx++) {
                 for (int dy = -radius; dy <= radius; dy++) {
                     if (Math.max(Math.abs(dx), Math.abs(dy)) != radius) continue;
@@ -227,11 +292,33 @@ public final class OpeningManager {
                     MapInfo info = controller.senseMapInfo(candidate);
                     if (!info.isPassable() || info.isWater() || info.isDam() || info.isSpawnZone()) continue;
                     if (!spacedFromOtherFlags(candidate)) continue;
-                    if (controller.senseLegalStartingFlagPlacement(candidate)) return candidate;
+                    if (!controller.senseLegalStartingFlagPlacement(candidate)) continue;
+                    int wallDistance = distanceToWall(candidate,
+                            controller.getMapWidth(), controller.getMapHeight());
+                    if (wallDistance < bestWallDistance
+                            || (wallDistance == bestWallDistance && radius < bestRadius)
+                            || (wallDistance == bestWallDistance && radius == bestRadius
+                            && compareLocation(candidate, best) < 0)) {
+                        best = candidate;
+                        bestWallDistance = wallDistance;
+                        bestRadius = radius;
+                    }
                 }
             }
+            if (bestWallDistance == 0) return best;
         }
-        return null;
+        return best;
+    }
+
+    static int distanceToWall(MapLocation location, int width, int height) {
+        return Math.min(Math.min(location.x, width - 1 - location.x),
+                Math.min(location.y, height - 1 - location.y));
+    }
+
+    private static int compareLocation(MapLocation a, MapLocation b) {
+        if (b == null) return -1;
+        if (a.x != b.x) return a.x - b.x;
+        return a.y - b.y;
     }
 
     private boolean spacedFromOtherFlags(MapLocation candidate) throws GameActionException {
@@ -247,7 +334,10 @@ public final class OpeningManager {
     private void prepareConstruction(TurnContext turn, boolean forceSingle) throws GameActionException {
         constructionTarget = null;
         if (!isEligibleBuilder(turn) || turn.hasFlag
+                || !allFlagsPlaced()
                 || (symmetry == OpeningLayoutPlanner.Symmetry.UNKNOWN && !forceSingle)) {
+            assignedSite = null;
+            assignedGlobalStage = -1;
             return;
         }
         int stage = shared.readFortificationStage();
@@ -264,13 +354,12 @@ public final class OpeningManager {
             return;
         }
 
-        int plannerStage = stage < 4 ? stage : stage - 1;
-        int cycle = plannerStage / 4;
-        int stageWithinCycle = plannerStage % 4;
-        if (cycle >= 3) return;
+        int cycle = constructionCycleForStage(stage);
+        int stageWithinCycle = constructionLayerForStage(stage);
         MapLocation[] flagLocations = plannedFlagLocations(forceSingle);
         int[] zones = plannedZones(forceSingle);
         int siteCount = FortificationPlanner.runtimeSiteCount(flagLocations, stageWithinCycle);
+        maintainConstructionQueue(turn.round, siteCount);
         if (shared.readFortificationCompleted() >= siteCount) {
             shared.advanceFortificationStage(stage);
             assignedSite = null;
@@ -280,12 +369,55 @@ public final class OpeningManager {
             int index = shared.claimConstructionIndex(siteCount);
             if (index >= 0) {
                 assignedSite = FortificationPlanner.runtimeSiteAt(
-                        flagLocations, zones, cycle, stageWithinCycle, index);
+                        flagLocations, zones, cycle, stageWithinCycle, index,
+                        controller.getMapWidth(), controller.getMapHeight());
                 assignedGlobalStage = stage;
                 assignedRound = turn.round;
             }
         }
         if (assignedSite != null) constructionTarget = assignedSite.location;
+    }
+
+    private void maintainConstructionQueue(int round, int siteCount) throws GameActionException {
+        if (!coordinator) return;
+        int word = shared.readFortificationWord();
+        if (word != observedFortificationWord) {
+            observedFortificationWord = word;
+            fortificationProgressRound = round;
+            return;
+        }
+        int completed = shared.readFortificationCompleted();
+        int cursor = shared.readConstructionCursor();
+        if (shouldRequeueConstruction(cursor, siteCount, completed,
+                round, fortificationProgressRound)) {
+            shared.writeConstructionCursor(0);
+            fortificationProgressRound = round;
+        }
+    }
+
+    static boolean shouldRequeueConstruction(
+            int cursor,
+            int siteCount,
+            int completed,
+            int round,
+            int lastProgressRound
+    ) {
+        return cursor >= siteCount && completed < siteCount
+                && round - lastProgressRound >= CONSTRUCTION_STALL_ROUNDS;
+    }
+
+    static int constructionCycleForStage(int stage) {
+        if (stage < 4) return 0;
+        if (stage <= 8) return 1;
+        if (stage <= 12) return 0;
+        return 2;
+    }
+
+    static int constructionLayerForStage(int stage) {
+        if (stage < 4) return stage;
+        if (stage <= 8) return stage - 5;
+        if (stage <= 12) return stage - 9;
+        return stage - 13;
     }
 
     private MapLocation[] plannedFlagLocations(boolean forceSingle) throws GameActionException {
@@ -332,35 +464,63 @@ public final class OpeningManager {
         return false;
     }
 
-    private boolean tryCarrierInnerStun(TurnContext turn) throws GameActionException {
-        if (!controller.isActionReady() || carrierSlot < 0 || turn.round >= 198) return false;
-        MapLocation reserved = shared.readFlagLocation(carrierSlot);
-        if (reserved == null || turn.location.distanceSquaredTo(reserved) > 2) return false;
-        Direction[] cardinal = Direction.cardinalDirections();
-        int start = Math.floorMod(turn.round + carrierSlot, cardinal.length);
-        for (int rank = 0; rank < cardinal.length; rank++) {
-            int index = (start + rank) % cardinal.length;
-            if ((carrierStunMask & (1 << index)) != 0) continue;
-            MapLocation site = reserved.add(cardinal[index]);
-            if (!controller.onTheMap(site) || !controller.canSenseLocation(site)) {
-                carrierStunMask |= 1 << index;
-                continue;
-            }
-            MapInfo info = controller.senseMapInfo(site);
-            if (info.getTrapType() != TrapType.NONE) {
-                carrierStunMask |= 1 << index;
-                continue;
-            }
-            if (economy.canSpendStrategic(TrapType.STUN.buildCost)
-                    && controller.canBuild(TrapType.STUN, site)) {
-                controller.build(TrapType.STUN, site);
-                economy.recordStrategicSpend(TrapType.STUN.buildCost);
-                carrierStunMask |= 1 << index;
-                if (shared.readFortificationStage() == 0) shared.completeFortificationSite();
-                return true;
+    private int recoverableFlagSlot(MapLocation location) throws GameActionException {
+        MapLocation[] locations = new MapLocation[3];
+        int[] statuses = new int[3];
+        for (int slot = 0; slot < 3; slot++) {
+            locations[slot] = shared.readFlagLocation(slot);
+            statuses[slot] = shared.readFlagStatus(slot);
+        }
+        return selectRecoverableFlagSlot(location, locations, statuses, spawnCenters);
+    }
+
+    static int selectRecoverableFlagSlot(
+            MapLocation flag,
+            MapLocation[] locations,
+            int[] statuses,
+            MapLocation[] spawnCenters
+    ) {
+        for (int slot = 0; slot < 3; slot++) {
+            if (statuses[slot] == FLAG_STATUS_PLACED
+                    && flag.equals(locations[slot])) return -1;
+        }
+
+        int spawnSlot = nearest(flag, spawnCenters);
+        if (statuses[spawnSlot] != FLAG_STATUS_PLACED
+                && flag.distanceSquaredTo(spawnCenters[spawnSlot]) <= 2) return spawnSlot;
+
+        int best = -1;
+        int bestDistance = Integer.MAX_VALUE;
+        for (int slot = 0; slot < 3; slot++) {
+            if (locations[slot] == null) continue;
+            int distance = flag.distanceSquaredTo(locations[slot]);
+            if (distance < bestDistance || (distance == bestDistance && slot < best)) {
+                best = slot;
+                bestDistance = distance;
             }
         }
-        return false;
+        return best;
+    }
+
+    private boolean allFlagsPlaced() throws GameActionException {
+        for (int slot = 0; slot < 3; slot++) {
+            if (shared.readFlagStatus(slot) != FLAG_STATUS_PLACED
+                    || shared.readFlagLocation(slot) == null) return false;
+        }
+        return true;
+    }
+
+    private static int nearest(MapLocation location, MapLocation[] candidates) {
+        int best = 0;
+        int bestDistance = location.distanceSquaredTo(candidates[0]);
+        for (int i = 1; i < candidates.length; i++) {
+            int distance = location.distanceSquaredTo(candidates[i]);
+            if (distance < bestDistance) {
+                best = i;
+                bestDistance = distance;
+            }
+        }
+        return best;
     }
 
     private void finishAssignedSite() throws GameActionException {
@@ -394,6 +554,15 @@ public final class OpeningManager {
                 + "|minCrumbs=" + shared.readMinimumCrumbs());
     }
 
+    private void printDefenseSummary(TurnContext turn) throws GameActionException {
+        System.out.println("DEFENSE_SUMMARY|round=" + turn.round
+                + "|stage=" + shared.readFortificationStage()
+                + "|done=" + shared.readFortificationCompleted()
+                + "|cursor=" + shared.readConstructionCursor()
+                + "|spend=" + shared.readStrategicSpend()
+                + "|crumbs=" + controller.getCrumbs());
+    }
+
     private int actualZoneCount() throws GameActionException {
         MapLocation[] flags = new MapLocation[3];
         for (int i = 0; i < flags.length; i++) flags[i] = shared.readFlagLocation(i);
@@ -423,8 +592,10 @@ public final class OpeningManager {
     }
 
     private boolean isEligibleBuilder(TurnContext turn) {
-        if (builder) return true;
-        if (turn.round > GameConstants.SETUP_ROUNDS) return false;
+        if (builder || coordinator) return true;
+        if (turn.round > GameConstants.SETUP_ROUNDS) {
+            return surplusConstructionEnabled(turn.round, controller.getCrumbs(), stableId);
+        }
         try {
             for (int i = 0; i < 3; i++) {
                 MapLocation flag = shared.readFlagLocation(i);
@@ -434,5 +605,13 @@ public final class OpeningManager {
             return false;
         }
         return false;
+    }
+
+    static boolean surplusConstructionEnabled(int round, int crumbs, int stableId) {
+        if (round <= GameConstants.SETUP_ROUNDS) return false;
+        int cohort = Math.floorMod(stableId, 5);
+        return (cohort == 1 && crumbs >= SURPLUS_CONSTRUCTION_CRUMBS)
+                || (cohort == 2 && crumbs >= ABUNDANT_CONSTRUCTION_CRUMBS)
+                || (cohort == 3 && crumbs >= OVERFLOW_CONSTRUCTION_CRUMBS);
     }
 }

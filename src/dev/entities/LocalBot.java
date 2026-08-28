@@ -134,7 +134,7 @@ public final class LocalBot extends Bot {
                 return new Objective(ObjectiveType.SETUP_FLAG, turn.location, false);
             }
         }
-        if (turn.hasFlag) {
+        if (controller.hasFlag()) {
             return new Objective(ObjectiveType.RETURN, nearestSpawn(turn.location), true);
         }
 

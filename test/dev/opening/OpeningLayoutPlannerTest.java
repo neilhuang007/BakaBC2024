@@ -32,6 +32,7 @@ public class OpeningLayoutPlannerTest {
             OpeningLayoutPlanner.Layout layout = planner.plan(symmetry);
             assertEquals(1, layout.zoneCount);
             assertLegalSpacing(layout.primaryTargets);
+            assertFlagsTouchCornerWalls(layout.primaryTargets, 31, 31);
         }
     }
 
@@ -89,6 +90,13 @@ public class OpeningLayoutPlannerTest {
                 assertTrue(locations[i].distanceSquaredTo(locations[j])
                         >= GameConstants.MIN_FLAG_SPACING_SQUARED);
             }
+        }
+    }
+
+    private static void assertFlagsTouchCornerWalls(MapLocation[] locations, int width, int height) {
+        for (MapLocation location : locations) {
+            assertTrue(location.x == 0 || location.y == 0
+                    || location.x == width - 1 || location.y == height - 1);
         }
     }
 

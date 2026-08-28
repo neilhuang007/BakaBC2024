@@ -47,7 +47,9 @@ public final class FortificationPlanner {
             int[] zones,
             int cycle,
             int stageWithinCycle,
-            int index
+            int index,
+            int width,
+            int height
     ) {
         int perFlag = stageWithinCycle == 2 ? 8 : stageWithinCycle == 3 ? 12 : 4;
         int flagIndex = index / perFlag;
@@ -81,7 +83,9 @@ public final class FortificationPlanner {
             dy = (corner & 1) == 0 ? radius : -radius;
             kind = Kind.WATER;
         }
-        return new Site(new MapLocation(flag.x + dx, flag.y + dy), kind,
+        MapLocation location = new MapLocation(flag.x + dx, flag.y + dy);
+        if (kind != Kind.WATER) location = projectTrapInward(location, width, height);
+        return new Site(location, kind,
                 cycle * 4 + stageWithinCycle, zones[flagIndex]);
     }
 
@@ -273,11 +277,18 @@ public final class FortificationPlanner {
             int stage,
             int zone
     ) {
+        if (kind != Kind.WATER) location = projectTrapInward(location, width, height);
         if (location.x < 0 || location.y < 0 || location.x >= width || location.y >= height) return;
         for (Site site : unique) {
             if (site.location.equals(location)) return;
         }
         unique.add(new Site(location, kind, stage, zone));
+    }
+
+    static MapLocation projectTrapInward(MapLocation location, int width, int height) {
+        int x = Math.max(1, Math.min(width - 2, location.x));
+        int y = Math.max(1, Math.min(height - 2, location.y));
+        return new MapLocation(x, y);
     }
 
     private static final class Bounds {
