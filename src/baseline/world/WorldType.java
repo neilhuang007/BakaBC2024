@@ -4,5 +4,6 @@ public enum WorldType {
     UNKNOWN,
     HORIZONTAL,
     VERTICAL,
-    ROTATIONAL
+    ROTATIONAL,
+    ALL
 }
